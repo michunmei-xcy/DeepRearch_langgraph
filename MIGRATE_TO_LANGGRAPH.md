@@ -66,10 +66,12 @@ tavily-python = "*"             # 保留
 - `search.py`：把 `dispatch_search()` 包装为 `@tool`
 - `notes.py`：把 note 的 create/read/update 包装为 `@tool`
 
+> **决策**：`execute_task_node` 使用 `create_react_agent` + ReAct 模式，LLM 自主决定何时调用搜索工具，因此工具必须包装为 `@tool`。
+
 ### 5. 改写三个服务为 LangGraph 节点函数
 
 - `planner.py` → `planner_node(state) -> dict`
-- `summarizer.py` → `execute_task_node(state) -> dict`
+- `summarizer.py` → **删除**，搜索+总结合并进 `execute_task_node` 的 ReAct agent
 - `reporter.py` → `reporter_node(state) -> dict`
 
 ### 6. 重写 `agent.py` 为 StateGraph
@@ -128,7 +130,14 @@ def get_llm():
 
 ### 工具层
 
-把原来的 `SearchTool`、`NoteTool` 包装为标准 LangChain tool，方便在 node 里调用或传给 ReAct agent。
+把原来的 `SearchTool`、`NoteTool` 包装为标准 LangChain `@tool`，传给 `create_react_agent`。
+
+**决策：`execute_task_node` 使用 ReAct 模式**，LLM 自主决定何时调用搜索工具，而非固定调用顺序。因此：
+- `web_search`：包装 `dispatch_search` + `prepare_research_context`，返回格式化后的搜索内容字符串
+- `save_note` / `read_note`：包装 note 操作
+- `_config` 通过闭包或工厂函数注入，让工具能读取运行时配置
+
+**`summarizer.py` 可以删除**：搜索和总结合并进 ReAct agent，不再需要单独的 `SummarizationService`。
 
 ```python
 # services/search.py
@@ -158,59 +167,22 @@ def read_note(note_id: str) -> str:
 
 每个节点接收完整 state，返回**部分更新的 dict**，LangGraph 自动 merge。
 
-```python
-# planner node
-def planner_node(state: ResearchState) -> dict:
-    response = llm_with_tools.invoke([
-        SystemMessage(PLANNER_PROMPT),
-        HumanMessage(state["research_topic"]),
-    ])
-    todo_items = parse_todo_items(response.content)  # 复用原有 JSON 解析逻辑
-    return {
-        "todo_items": todo_items,
-        "current_task_index": 0,
-    }
+**planner_node**：调 LLM，解析 JSON，生成 todo_items，发 `todo_list` SSE 事件，返回 `{todo_items, current_task_index: 0}`。
 
-# execute_task node（搜索 + 总结）
-def execute_task_node(state: ResearchState) -> dict:
-    idx = state["current_task_index"]
-    task = state["todo_items"][idx]
+**execute_task_node（ReAct 模式）**：
+- 从 state 取出当前 task（by `current_task_index`）
+- 发 `task_status(in_progress)` 事件
+- 用 `create_react_agent(llm, tools)` 构建 ReAct agent（每个 task 独立实例）
+- 用 `astream_events` 流式运行 agent，从中提取：
+  - `on_chat_model_stream` → 发 `task_summary_chunk` 事件，同时累积完整 summary
+  - `on_tool_end` → 发 `tool_call` 事件
+- 过滤 thinking token 后，将 summary 写入 `task.summary`，task.status 改为 "completed"
+- 发 `task_status(completed)` 事件
+- 返回 `{todo_items（原地修改后的同一列表）, current_task_index+1}`
 
-    # 搜索
-    search_result = web_search.invoke({"query": task.query})
+**reporter_node**：汇总所有 task.summary，调 LLM 生成报告，发 `final_report` 事件。
 
-    # 总结
-    response = llm.invoke([
-        SystemMessage(SUMMARIZER_PROMPT),
-        HumanMessage(format_research_context(task, search_result)),
-    ])
-    summary = strip_thinking_tokens(response.content)
-
-    # 更新 task 状态（注意：todo_items 是 Annotated[list, operator.add]，
-    # 需要用替换整个列表或用自定义 reducer 的方式更新单个 item）
-    updated_items = state["todo_items"].copy()
-    updated_items[idx] = dataclasses.replace(task, status="completed", summary=summary)
-
-    return {
-        "todo_items": updated_items,           # 如果用自定义 reducer 则只传更新项
-        "sources_gathered": search_result["sources"],
-        "current_task_index": idx + 1,
-    }
-
-# reporter node
-def reporter_node(state: ResearchState) -> dict:
-    all_summaries = "\n\n".join(t.summary for t in state["todo_items"])
-    response = llm.invoke([
-        SystemMessage(REPORTER_PROMPT),
-        HumanMessage(all_summaries),
-    ])
-    return {"structured_report": response.content}
-```
-
-> **注意**：`todo_items` 用了 `operator.add`（追加语义），但执行阶段是**更新**已有项而非追加新项。
-> 有两种解决方式：
-> - **方式A（推荐）**：`todo_items` 改为普通字段（不用 `Annotated`），planner 一次性写入，后续节点直接替换整个列表。
-> - **方式B**：为 `todo_items` 写自定义 reducer，根据 `id` merge。
+> **`todo_items` 用方式A**（plain list，无 Annotated reducer）：planner 一次性写入，execute_task 原地修改 dataclass 字段后返回同一列表引用。
 
 ---
 
