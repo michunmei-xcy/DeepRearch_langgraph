@@ -1,59 +1,70 @@
-"""Helpers for coordinating note tool usage instructions."""
+"""Note tools: create / read / update markdown notes as LangChain @tool."""
 
 from __future__ import annotations
 
-import json
+import logging
+import os
+import uuid
+from pathlib import Path
 
-from models import TodoItem
+from langchain_core.tools import tool
+
+logger = logging.getLogger(__name__)
+
+NOTES_WORKSPACE = os.getenv("NOTES_WORKSPACE", "./notes")
 
 
-def build_note_guidance(task: TodoItem) -> str:
-    """Generate note tool usage guidance for a specific task."""
+def _notes_dir() -> Path:
+    path = Path(NOTES_WORKSPACE)
+    path.mkdir(parents=True, exist_ok=True)
+    return path
 
-    tags_list = ["deep_research", f"task_{task.id}"]
-    tags_literal = json.dumps(tags_list, ensure_ascii=False)
 
-    if task.note_id:
-        read_payload = json.dumps({"action": "read", "note_id": task.note_id}, ensure_ascii=False)
-        update_payload = json.dumps(
-            {
-                "action": "update",
-                "note_id": task.note_id,
-                "task_id": task.id,
-                "title": f"任务 {task.id}: {task.title}",
-                "note_type": "task_state",
-                "tags": tags_list,
-                "content": "请将本轮新增信息补充到任务概览中",
-            },
-            ensure_ascii=False,
-        )
+def _note_path(note_id: str) -> Path:
+    return _notes_dir() / f"{note_id}.md"
 
-        return (
-            "笔记协作指引：\n"
-            f"- 当前任务笔记 ID：{task.note_id}。\n"
-            f"- 在书写总结前必须调用：[TOOL_CALL:note:{read_payload}] 获取最新内容。\n"
-            f"- 完成分析后调用：[TOOL_CALL:note:{update_payload}] 同步增量信息。\n"
-            "- 更新时保持原有段落结构，新增内容请在对应段落中补充。\n"
-            f"- 建议 tags 保持为 {tags_literal}，保证其他 Agent 可快速定位。\n"
-            "- 成功同步到笔记后，再输出面向用户的总结。\n"
-        )
 
-    create_payload = json.dumps(
-        {
-            "action": "create",
-            "task_id": task.id,
-            "title": f"任务 {task.id}: {task.title}",
-            "note_type": "task_state",
-            "tags": tags_list,
-            "content": "请记录任务概览、来源概览",
-        },
-        ensure_ascii=False,
-    )
+@tool
+def create_note(title: str, content: str, note_type: str, tags: list[str]) -> str:
+    """Create a new research note and return its note_id.
+    Use this to persist task findings so they can be retrieved later."""
+    note_id = uuid.uuid4().hex[:8]
+    tag_line = ", ".join(tags)
+    text = f"# {title}\n\n**type:** {note_type}  \n**tags:** {tag_line}\n\n{content}\n"
+    try:
+        _note_path(note_id).write_text(text, encoding="utf-8")
+        logger.info("Created note %s: %s", note_id, title)
+        return f"笔记已创建，ID: {note_id}"
+    except Exception as exc:
+        logger.error("Failed to create note: %s", exc)
+        return f"笔记创建失败：{exc}"
 
-    return (
-        "笔记协作指引：\n"
-        f"- 当前任务尚未建立笔记，请先调用：[TOOL_CALL:note:{create_payload}]。\n"
-        "- 创建成功后记录返回的 note_id，并在后续所有更新中复用。\n"
-        "- 同步笔记后，再输出面向用户的总结。\n"
-    )
 
+@tool
+def read_note(note_id: str) -> str:
+    """Read a previously saved note by its note_id. Returns the full note content."""
+    path = _note_path(note_id)
+    if not path.exists():
+        return f"笔记 {note_id} 不存在。"
+    try:
+        return path.read_text(encoding="utf-8")
+    except Exception as exc:
+        logger.error("Failed to read note %s: %s", note_id, exc)
+        return f"笔记读取失败：{exc}"
+
+
+@tool
+def update_note(note_id: str, title: str, content: str, tags: list[str]) -> str:
+    """Update an existing note with new content. Use this to append new findings to a task note."""
+    path = _note_path(note_id)
+    if not path.exists():
+        return f"笔记 {note_id} 不存在，无法更新。"
+    tag_line = ", ".join(tags)
+    text = f"# {title}\n\n**tags:** {tag_line}\n\n{content}\n"
+    try:
+        path.write_text(text, encoding="utf-8")
+        logger.info("Updated note %s", note_id)
+        return f"笔记 {note_id} 已更新。"
+    except Exception as exc:
+        logger.error("Failed to update note %s: %s", note_id, exc)
+        return f"笔记更新失败：{exc}"
