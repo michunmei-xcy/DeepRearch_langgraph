@@ -345,12 +345,13 @@ async def research_stream(request: ResearchRequest):
 - [ ] 用同步 `graph.invoke()` 做端到端测试
 
 ### Step 9：改写流式端点
-- [ ] 在 `main.py` 中把 `/research/stream` 改为用 `graph.astream_events()`
-- [ ] 对齐前端期望的事件类型（`todo_list`、`task_summary_chunk`、`final_report`、`done`）
+- [ ] 在 `main.py` 中把 `/research/stream` 改为用 `asyncio.Queue + event_sink + graph.ainvoke` 模式（见下方代码示例）
+- [ ] 对齐前端期望的全部 10 种事件类型（见"SSE 事件完整列表"）
+- [ ] 加 try/except，异常时发 `{"type": "error", "detail": str(exc)}`，finally 发 `{"type": "done"}`
 - [ ] 浏览器端测试 SSE 流
 
 ### Step 10：收尾
-- [ ] 删除 `services/tool_events.py`（如果不再需要手动追踪）
+- [ ] **保留** `services/tool_events.py`，改写为 `ToolCallSink`（不要删除，前端依赖 `tool_call` 事件）
 - [ ] 清理 `agent.py` 中旧的 `DeepResearchAgent` 类
 - [ ] 更新 `.env.example` 中的配置项
 
@@ -373,8 +374,136 @@ async def research_stream(request: ResearchRequest):
 | `prompts.py` | 不改 | 系统提示词直接复用 |
 | `utils.py` | 不改 | 工具函数直接复用 |
 | `services/text_processing.py` | 不改 | 直接复用 |
-| `services/tool_events.py` | 可删除 | 用 astream_events 事件替代 |
+| `services/tool_events.py` | **保留+改写** | 改为 ToolCallSink，`record()` 直接调 event_sink；**不要删除**，前端 App.vue 依赖 `tool_call` 事件 |
+| `services/streaming.py` | **新建** | `ThinkingFilterHandler(BaseCallbackHandler)`，流式过滤 `<think>` token |
 | `frontend/` | 不改 | SSE 格式保持兼容即可 |
+
+---
+
+## 已知行为变化
+
+> **并行 → 串行**：原代码用 ThreadPoolExecutor 并行执行多个 task，本次迁移改为 LangGraph StateGraph 串行执行。
+> 功能完整，但多任务时速度会变慢。
+> 升级路径：用 LangGraph **Send API** 实现 fan-out 并行（独立优化，不在本次迁移范围内）。
+
+---
+
+## SSE 事件完整列表
+
+前端（App.vue）期望 10 种事件，全部需要从节点内通过 `event_sink` 发出：
+
+| 事件类型 | 发出时机 | 发出节点 |
+|---|---|---|
+| `status` | 每个阶段开始时 | planner_node, execute_task_node |
+| `todo_list` | 规划完成后 | planner_node |
+| `task_status` (in_progress) | 每个 task 开始前 | execute_task_node |
+| `task_status` (completed/skipped/failed) | 每个 task 结束后 | execute_task_node |
+| `sources` | 搜索完成后 | execute_task_node |
+| `task_summary_chunk` | LLM token 流 | ThinkingFilterHandler 回调 |
+| `tool_call` | 工具被调用时 | ToolCallSink.record() |
+| `final_report` | 报告生成后 | reporter_node |
+| `report_note` | 笔记持久化后 | reporter_node |
+| `error` | 任意异常 | main.py except 块 |
+| `done` | 流结束 | main.py finally 块 |
+
+---
+
+## 流式端点正确写法（asyncio.Queue 模式）
+
+```python
+@app.post("/research/stream")
+async def research_stream(request: ResearchRequest):
+    loop = asyncio.get_event_loop()
+    queue: asyncio.Queue[dict | None] = asyncio.Queue()
+
+    def event_sink(event: dict) -> None:
+        loop.call_soon_threadsafe(queue.put_nowait, event)
+
+    async def event_generator():
+        try:
+            graph_task = asyncio.create_task(
+                graph.ainvoke(
+                    {"research_topic": request.topic},
+                    config={"configurable": {
+                        "event_sink": event_sink,
+                        "config": Configuration.from_env(),
+                    }},
+                )
+            )
+            while True:
+                try:
+                    event = await asyncio.wait_for(queue.get(), timeout=0.1)
+                    if event is None:
+                        break
+                    yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+                except asyncio.TimeoutError:
+                    if graph_task.done():
+                        while not queue.empty():
+                            e = queue.get_nowait()
+                            if e is not None:
+                                yield f"data: {json.dumps(e, ensure_ascii=False)}\n\n"
+                        break
+            if graph_task.exception():
+                raise graph_task.exception()
+        except Exception as exc:
+            yield f"data: {json.dumps({'type': 'error', 'detail': str(exc)})}\n\n"
+        finally:
+            yield f"data: {json.dumps({'type': 'done'})}\n\n"
+
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
+```
+
+## 节点内发送事件的模式
+
+```python
+def planner_node(state: ResearchState, config: RunnableConfig) -> dict:
+    sink = config["configurable"]["event_sink"]
+    cfg  = config["configurable"]["config"]
+
+    sink({"type": "status", "message": "开始规划研究任务", "step": 0})
+    todo_items = PlanningService(...).plan_todo_list(state)
+    if not todo_items:
+        todo_items = [PlanningService.create_fallback_task(state)]  # 空结果时 fallback
+    sink({"type": "todo_list", "tasks": [asdict(t) for t in todo_items], "step": 0})
+    return {"todo_items": todo_items, "current_task_index": 0}
+
+
+def execute_task_node(state: ResearchState, config: RunnableConfig) -> dict:
+    sink = config["configurable"]["event_sink"]
+    idx  = state["current_task_index"]
+    task = state["todo_items"][idx]
+    step = idx + 1
+
+    sink({"type": "task_status", "task_id": task.id,
+          "status": "in_progress", "title": task.title, "intent": task.intent, "step": step})
+
+    search_result = dispatch_search(task.query, ...)
+    if not search_result:
+        task.status = "skipped"
+        sink({"type": "task_status", "task_id": task.id, "status": "skipped", "step": step})
+        return {"todo_items": state["todo_items"], "current_task_index": idx + 1}
+
+    context = prepare_research_context(task, search_result)
+    sink({"type": "sources", "task_id": task.id,
+          "latest_sources": format_sources(search_result), "step": step})
+
+    # ThinkingFilterHandler 在 on_llm_new_token 里自动发 task_summary_chunk 事件
+    handler = ThinkingFilterHandler(sink, task.id, step, cfg.strip_thinking_tokens)
+    llm.invoke([...], config={"callbacks": [handler]})
+    summary = handler.full_visible_text
+
+    task.status = "completed"
+    task.summary = summary
+    sink({"type": "task_status", "task_id": task.id,
+          "status": "completed", "summary": summary, "step": step})
+
+    return {
+        "todo_items": state["todo_items"],   # 方式A：直接返回同一个列表引用
+        "current_task_index": idx + 1,
+        "web_research_results": [context],
+        "sources_gathered": [format_sources(search_result)],
+    }
+```
 
 ---
 
@@ -382,6 +511,6 @@ async def research_stream(request: ResearchRequest):
 
 - LangGraph 官方文档：https://langchain-ai.github.io/langgraph/
 - StateGraph API：https://langchain-ai.github.io/langgraph/reference/graphs/
-- astream_events：https://python.langchain.com/docs/how_to/streaming/#using-stream-events
+- LangChain BaseCallbackHandler：https://python.langchain.com/docs/how_to/custom_callbacks/
 - ChatOpenAI with custom base_url：https://python.langchain.com/docs/integrations/chat/openai/
-- create_react_agent（如果想用 prebuilt）：https://langchain-ai.github.io/langgraph/reference/prebuilt/
+- LangGraph Send API（并行升级路径）：https://langchain-ai.github.io/langgraph/how-tos/map-reduce/
