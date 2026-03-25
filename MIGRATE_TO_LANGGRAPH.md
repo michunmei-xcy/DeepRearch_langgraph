@@ -507,6 +507,110 @@ def execute_task_node(state: ResearchState, config: RunnableConfig) -> dict:
 
 ---
 
+## 上下文管理改进（独立于 LangGraph 迁移，可单独做）
+
+### 问题列表
+
+| 编号 | 文件 | 问题 | 影响 |
+|---|---|---|---|
+| P1 | `utils.py` | `content` 字段无截断（`raw_content` 有，`content` 没有）| Bug，某些搜索 API 返回超长 content |
+| P2 | `utils.py` | 无总 token 预算，5 个来源可能叠出超大字符串 | 风险，summarizer prompt 可能爆炸 |
+| P3 | `reporter.py` | task summary 无截断，随 task 数无限增长 | 风险，reporter prompt 随任务数增长 |
+| P4 | `search.py` | `MAX_TOKENS_PER_SOURCE = 2000` 硬编码，不可配置 | 可维护性差 |
+
+### 实现顺序
+
+`config.py` → `utils.py` → `search.py` → `reporter.py`
+
+### 改动 1：config.py 新增 3 个字段
+
+```python
+max_tokens_per_source: int = Field(
+    default=2000,
+    description="每个搜索结果来源最多包含的 token 数",
+)
+max_total_context_tokens: int = Field(
+    default=8000,
+    description="单次 LLM 调用中所有来源合并后的最大 token 数（0=不限制）",
+)
+max_reporter_summary_chars: int = Field(
+    default=2000,
+    description="reporter prompt 中每个 task summary 的最大字符数",
+)
+```
+
+在 `from_env()` 的 `env_aliases` 里加：
+```python
+"max_tokens_per_source": os.getenv("MAX_TOKENS_PER_SOURCE"),
+"max_total_context_tokens": os.getenv("MAX_TOTAL_CONTEXT_TOKENS"),
+"max_reporter_summary_chars": os.getenv("MAX_REPORTER_SUMMARY_CHARS"),
+```
+
+### 改动 2：utils.py 修复 content 截断 + 加总预算
+
+函数签名加参数：
+```python
+def deduplicate_and_format_sources(
+    search_response,
+    max_tokens_per_source: int,
+    *,
+    fetch_full_page: bool = False,
+    max_total_context_tokens: int = 0,   # 0 = 不限制，向后兼容
+) -> str:
+```
+
+循环前计算 `char_limit`，对 `content` 加截断（P1）：
+```python
+char_limit = max_tokens_per_source * CHARS_PER_TOKEN
+for source in unique_sources.values():
+    content = source.get("content", "")
+    if len(content) > char_limit:
+        content = f"{content[:char_limit]}... [truncated]"
+    # ...原有 raw_content 截断逻辑里删掉重复的 char_limit = ... 那行
+```
+
+返回前加总预算截断（P2）：
+```python
+result = "".join(formatted_parts).strip()
+if max_total_context_tokens > 0:
+    total_char_limit = max_total_context_tokens * CHARS_PER_TOKEN
+    if len(result) > total_char_limit:
+        result = f"{result[:total_char_limit]}... [context truncated]"
+return result
+```
+
+### 改动 3：search.py 删除硬编码常量
+
+删除：`MAX_TOKENS_PER_SOURCE = 2000`
+
+`dispatch_search()` 里替换：
+```python
+"max_tokens_per_source": config.max_tokens_per_source,
+```
+
+`prepare_research_context()` 里替换：
+```python
+context = deduplicate_and_format_sources(
+    search_result or {"results": []},
+    max_tokens_per_source=config.max_tokens_per_source,
+    fetch_full_page=config.fetch_full_page,
+    max_total_context_tokens=config.max_total_context_tokens,
+)
+```
+
+### 改动 4：reporter.py 截断 task summary
+
+```python
+summary_char_limit = self._config.max_reporter_summary_chars
+for task in state.todo_items:
+    summary_block = task.summary or "暂无可用信息"
+    if len(summary_block) > summary_char_limit:
+        summary_block = f"{summary_block[:summary_char_limit]}... [truncated]"
+    # ...其余不变
+```
+
+---
+
 ## 参考资料
 
 - LangGraph 官方文档：https://langchain-ai.github.io/langgraph/
