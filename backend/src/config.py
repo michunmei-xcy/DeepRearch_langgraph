@@ -1,3 +1,4 @@
+"""把 HelloAgentsLLM 换成 ChatOpenAI（可对接 Ollama/LMStudio/custom）。 配置读取逻辑基本不变。"""
 import os
 from enum import Enum
 from typing import Any, Optional
@@ -86,6 +87,21 @@ class Configuration(BaseModel):
         title="LLM Model ID",
         description="Optional model identifier for custom OpenAI-compatible services",
     )
+    max_tokens_per_source: int = Field(
+        default=2000,
+        description="每个搜索结果来源最多包含的 token 数",
+    )
+    max_total_context_tokens: int = Field(
+        default=8000,
+        description="单次 LLM 调用中所有来源合并后的最大 token 数（0=不限制）",
+    )
+    max_reporter_summary_chars: int = Field(
+        default=2000,
+        description="reporter prompt 中每个 task summary 的最大字符数",
+    )
+
+
+
 
     @classmethod
     def from_env(cls, overrides: Optional[dict[str, Any]] = None) -> "Configuration":
@@ -115,6 +131,9 @@ class Configuration(BaseModel):
             "search_api": os.getenv("SEARCH_API"),
             "enable_notes": os.getenv("ENABLE_NOTES"),
             "notes_workspace": os.getenv("NOTES_WORKSPACE"),
+            "max_tokens_per_source":os.getenv("MAX_TOKENS_PER_SOURCE"),
+            "max_total_context_tokens":os.getenv("MAX_TOTAL_CONTEXT_TOKENS"),
+            "max_reporter_summary_chars":os.getenv("MAX_REPORTER_SUMMARY_CHARS") ,                                                                                                                                               
         }
 
         for key, value in env_aliases.items():
