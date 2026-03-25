@@ -1,97 +1,97 @@
-"""Search dispatch helpers leveraging HelloAgents SearchTool."""
+"""Search service: hybrid search (Tavily + DuckDuckGo) wrapped as LangChain @tool."""
 
 from __future__ import annotations
 
 import logging
-from typing import Any, Optional, Tuple
+import os
+from typing import Any
 
-from hello_agents.tools import SearchTool
+from langchain_community.tools import DuckDuckGoSearchResults
+from langchain_community.tools.tavily_search import TavilySearchResults
+from langchain_core.tools import tool
 
-from config import Configuration
-from utils import (
-    deduplicate_and_format_sources,
-    format_sources,
-    get_config_value,
-)
+from utils import deduplicate_and_format_sources, format_sources
 
 logger = logging.getLogger(__name__)
 
-MAX_TOKENS_PER_SOURCE = 2000
-_GLOBAL_SEARCH_TOOL = SearchTool(backend="hybrid")
+MAX_RESULTS_PER_BACKEND = 5
+MAX_TOKENS_PER_SOURCE = int(os.getenv("MAX_TOKENS_PER_SOURCE", "2000"))
+MAX_TOTAL_CONTEXT_TOKENS = int(os.getenv("MAX_TOTAL_CONTEXT_TOKENS", "8000"))
+
+_tavily = TavilySearchResults(max_results=MAX_RESULTS_PER_BACKEND)
+_ddg = DuckDuckGoSearchResults(max_results=MAX_RESULTS_PER_BACKEND, output_format="list")
 
 
-def dispatch_search(
-    query: str,
-    config: Configuration,
-    loop_count: int,
-) -> Tuple[dict[str, Any] | None, list[str], Optional[str], str]:
-    """Execute configured search backend and normalise response payload."""
+def _normalize_tavily(results: list[dict]) -> list[dict[str, Any]]:
+    """Normalize Tavily results to {url, title, content}."""
+    normalized = []
+    for r in results:
+        if not isinstance(r, dict):
+            continue
+        normalized.append({
+            "url": r.get("url", ""),
+            "title": r.get("title") or r.get("url", ""),
+            "content": r.get("content", ""),
+        })
+    return normalized
 
-    search_api = get_config_value(config.search_api)
+
+def _normalize_ddg(results: list[dict]) -> list[dict[str, Any]]:
+    """Normalize DuckDuckGo results to {url, title, content}."""
+    normalized = []
+    for r in results:
+        if not isinstance(r, dict):
+            continue
+        normalized.append({
+            "url": r.get("link", ""),
+            "title": r.get("title", ""),
+            "content": r.get("snippet", ""),
+        })
+    return normalized
+
+
+def _hybrid_search_results(query: str) -> list[dict[str, Any]]:
+    """Run Tavily and DuckDuckGo, merge and return normalized result list."""
+    results: list[dict[str, Any]] = []
 
     try:
-        raw_response = _GLOBAL_SEARCH_TOOL.run(
-            {
-                "input": query,
-                "backend": search_api,
-                "mode": "structured",
-                "fetch_full_page": config.fetch_full_page,
-                "max_results": 5,
-                "max_tokens_per_source": MAX_TOKENS_PER_SOURCE,
-                "loop_count": loop_count,
-            }
-        )
-    except Exception as exc:  # pragma: no cover - defensive logging
-        logger.exception("Search backend %s failed: %s", search_api, exc)
-        raise
+        tavily_raw = _tavily.invoke(query)
+        if isinstance(tavily_raw, list):
+            results.extend(_normalize_tavily(tavily_raw))
+            logger.info("Tavily returned %d results", len(tavily_raw))
+    except Exception as exc:
+        logger.warning("Tavily search failed: %s", exc)
 
-    if isinstance(raw_response, str):
-        notices = [raw_response]
-        logger.warning("Search backend %s returned text notice: %s", search_api, raw_response)
-        payload: dict[str, Any] = {
-            "results": [],
-            "backend": search_api,
-            "answer": None,
-            "notices": notices,
-        }
-    else:
-        payload = raw_response
-        notices = list(payload.get("notices") or [])
+    try:
+        ddg_raw = _ddg.invoke(query)
+        if isinstance(ddg_raw, list):
+            results.extend(_normalize_ddg(ddg_raw))
+            logger.info("DuckDuckGo returned %d results", len(ddg_raw))
+    except Exception as exc:
+        logger.warning("DuckDuckGo search failed: %s", exc)
 
-    backend_label = str(payload.get("backend") or search_api)
-    answer_text = payload.get("answer")
-    results = payload.get("results", [])
-
-    if notices:
-        for notice in notices:
-            logger.info("Search notice (%s): %s", backend_label, notice)
-
-    logger.info(
-        "Search backend=%s resolved_backend=%s answer=%s results=%s",
-        search_api,
-        backend_label,
-        bool(answer_text),
-        len(results),
-    )
-
-    return payload, notices, answer_text, backend_label
+    return results
 
 
-def prepare_research_context(
-    search_result: dict[str, Any] | None,
-    answer_text: Optional[str],
-    config: Configuration,
-) -> tuple[str, str]:
-    """Build structured context and source summary for downstream agents."""
+@tool
+def web_search(query: str) -> str:
+    """Search the web using hybrid search (Tavily + DuckDuckGo) and return formatted results with sources.
+    Use this tool to find up-to-date information about any topic."""
+    results = _hybrid_search_results(query)
 
-    sources_summary = format_sources(search_result)
+    if not results:
+        return "搜索未返回任何结果。"
+
+    search_response = {"results": results}
     context = deduplicate_and_format_sources(
-        search_result or {"results": []},
+        search_response,
         max_tokens_per_source=MAX_TOKENS_PER_SOURCE,
-        fetch_full_page=config.fetch_full_page,
+        max_total_context_tokens=MAX_TOTAL_CONTEXT_TOKENS,
     )
+    return context
 
-    if answer_text:
-        context = f"AI直接答案：\n{answer_text}\n\n{context}"
 
-    return sources_summary, context
+def get_sources_summary(query: str) -> str:
+    """Return a bullet-list summary of sources for SSE sources event."""
+    results = _hybrid_search_results(query)
+    return format_sources({"results": results})
