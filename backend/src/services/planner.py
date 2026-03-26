@@ -1,160 +1,112 @@
-"""Service responsible for converting the research topic into actionable tasks."""
+"""Planner node: LLM -> JSON -> TodoItem list."""
 
 from __future__ import annotations
-
 import json
 import logging
-import re
-from typing import Any, List, Optional
+from typing import Any, Callable, List
 
-from hello_agents import ToolAwareSimpleAgent
+from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.runnables import RunnableConfig
+from langchain_openai import ChatOpenAI
 
-from models import SummaryState, TodoItem
-from config import Configuration
-from prompts import get_current_date, todo_planner_instructions
+from models import ResearchState, TodoItem
+from prompts import get_current_date, todo_planner_instructions, todo_planner_system_prompt
 from utils import strip_thinking_tokens
-
 logger = logging.getLogger(__name__)
 
-TOOL_CALL_PATTERN = re.compile(
-    r"\[TOOL_CALL:(?P<tool>[^:]+):(?P<body>[^\]]+)\]",
-    re.IGNORECASE,
-)
+def make_planner_node(llm:ChatOpenAI) -> Callable:
+    """Return a LangGraph node function for task planning."""
 
-class PlanningService:
-    """Wraps the planner agent to produce structured TODO items."""
-
-    def __init__(self, planner_agent: ToolAwareSimpleAgent, config: Configuration) -> None:
-        self._agent = planner_agent
-        self._config = config
-
-    def plan_todo_list(self, state: SummaryState) -> List[TodoItem]:
-        """Ask the planner agent to break the topic into actionable tasks."""
-
-        prompt = todo_planner_instructions.format(
+    def planner_node(state:ResearchState,config:RunnableConfig) -> dict:
+        # 1.准备prompt
+        prompt=todo_planner_instructions.format(
             current_date=get_current_date(),
-            research_topic=state.research_topic,
+            research_topic=state["research_topic"],
         )
 
-        response = self._agent.run(prompt)
-        self._agent.clear_history()
+        # 2.调用LLM 
+        response=llm.invoke(
+            SystemMessage(content=todo_planner_system_prompt),
+            HumanMessage(content=prompt),
+        )
 
-        logger.info("Planner raw output (truncated): %s", response[:500])
+        # 3.提取回答内容解析JSON
+        raw=response.content if hasattr(response,"content") else str(response)
+        tasks_payload=_extract_tasks(raw)
 
-        tasks_payload = self._extract_tasks(response)
-        todo_items: List[TodoItem] = []
+        todo_items:List[TodoItem]=[]
 
+        # 4. 将 JSON 负载转换为 TodoItem 对象列表
         for idx, item in enumerate(tasks_payload, start=1):
             title = str(item.get("title") or f"任务{idx}").strip()
             intent = str(item.get("intent") or "聚焦主题的关键问题").strip()
-            query = str(item.get("query") or state.research_topic).strip()
-
+            query = str(item.get("query") or state["research_topic"]).strip()
+            
             if not query:
-                query = state.research_topic
+                query = state["research_topic"]
+                
+            todo_items.append(TodoItem(id=idx, title=title, intent=intent, query=query))
 
-            task = TodoItem(
-                id=idx,
-                title=title,
-                intent=intent,
-                query=query,
-            )
-            todo_items.append(task)
+        # 5.兜底策略：如果 LLM 没产出任务，创建一个默认任务
+        if not todo_items:
+            logger.info("Planner produced no tasks; using fallback")
+            todo_items = [TodoItem(
+                id=1,
+                title="基础背景梳理",
+                intent="收集主题的核心背景与最新动态",
+                query=f"{state['research_topic']} 最新进展",
+            )]
 
-        state.todo_items = todo_items
+        logger.info("Planner produced %d tasks", len(todo_items))
 
-        titles = [task.title for task in todo_items]
-        logger.info("Planner produced %d tasks: %s", len(todo_items), titles)
-        return todo_items
+        # 6.事件下发（用于UI更新或日志记录）
+        event_sink=(config.get("configurable") or {}).get("event_sink")
+        if event_sink:
+            event_sink({
+                "type": "todo_list",
+                "tasks": [
+                    {
+                        "id": t.id,
+                        "title": t.title,
+                        "intent": t.intent,
+                        "query": t.query,
+                        "status": t.status,
+                    }
+                    for t in todo_items
+                ],
+            })
+        return {"todo_items": todo_items, "current_task_index": 0}
+    return planner_node
 
-    @staticmethod
-    def create_fallback_task(state: SummaryState) -> TodoItem:
-        """Create a minimal fallback task when planning failed."""
-
-        return TodoItem(
-            id=1,
-            title="基础背景梳理",
-            intent="收集主题的核心背景与最新动态",
-            query=f"{state.research_topic} 最新进展" if state.research_topic else "基础背景梳理",
-        )
 
     # ------------------------------------------------------------------
     # Parsing helpers
     # ------------------------------------------------------------------
-    def _extract_tasks(self, raw_response: str) -> List[dict[str, Any]]:
-        """Parse planner output into a list of task dictionaries."""
+def _extract_tasks(raw: str) -> List[dict[str, Any]]:
+    """Parse planner output into a list of task dicts."""
+    # 去除大模型思考过程中的思绪令牌（如 <think>...</think>）
+    text = strip_thinking_tokens(raw).strip()
 
-        text = raw_response.strip()
-        if self._config.strip_thinking_tokens:
-            text = strip_thinking_tokens(text)
-
-        json_payload = self._extract_json_payload(text)
-        tasks: List[dict[str, Any]] = []
-
-        if isinstance(json_payload, dict):
-            candidate = json_payload.get("tasks")
-            if isinstance(candidate, list):
-                for item in candidate:
-                    if isinstance(item, dict):
-                        tasks.append(item)
-        elif isinstance(json_payload, list):
-            for item in json_payload:
-                if isinstance(item, dict):
-                    tasks.append(item)
-
-        if not tasks:
-            tool_payload = self._extract_tool_payload(text)
-            if tool_payload and isinstance(tool_payload.get("tasks"), list):
-                for item in tool_payload["tasks"]:
-                    if isinstance(item, dict):
-                        tasks.append(item)
-
-        return tasks
-
-    def _extract_json_payload(self, text: str) -> Optional[dict[str, Any] | list]:
-        """Try to locate and parse a JSON object or array from the text."""
-
-        start = text.find("{")
-        end = text.rfind("}")
-        if start != -1 and end != -1 and end > start:
-            candidate = text[start : end + 1]
-            try:
-                return json.loads(candidate)
-            except json.JSONDecodeError:
-                pass
-
-        start = text.find("[")
-        end = text.rfind("]")
-        if start != -1 and end != -1 and end > start:
-            candidate = text[start : end + 1]
-            try:
-                return json.loads(candidate)
-            except json.JSONDecodeError:
-                return None
-
-        return None
-
-    def _extract_tool_payload(self, text: str) -> Optional[dict[str, Any]]:
-        """Parse the first TOOL_CALL expression in the output."""
-
-        match = TOOL_CALL_PATTERN.search(text)
-        if not match:
-            return None
-
-        body = match.group("body")
-
+    # 尝试解析带有 "tasks" 键的 JSON 对象
+    start = text.find("{")
+    end = text.rfind("}")
+    if start != -1 and end > start:
         try:
-            payload = json.loads(body)
-            if isinstance(payload, dict):
-                return payload
+            obj = json.loads(text[start:end + 1])
+            if isinstance(obj, dict) and isinstance(obj.get("tasks"), list):
+                return [i for i in obj["tasks"] if isinstance(i, dict)]
         except json.JSONDecodeError:
             pass
 
-        parts = [segment.strip() for segment in body.split(",") if segment.strip()]
-        payload: dict[str, Any] = {}
-        for part in parts:
-            if "=" not in part:
-                continue
-            key, value = part.split("=", 1)
-            payload[key.strip()] = value.strip().strip('"').strip("'")
+    # 尝试直接解析 JSON 数组
+    start = text.find("[")
+    end = text.rfind("]")
+    if start != -1 and end > start:
+        try:
+            arr = json.loads(text[start:end + 1])
+            if isinstance(arr, list):
+                return [i for i in arr if isinstance(i, dict)]
+        except json.JSONDecodeError:
+            pass
 
-        return payload or None
+    return []
