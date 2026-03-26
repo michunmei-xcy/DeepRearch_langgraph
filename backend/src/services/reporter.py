@@ -2,76 +2,89 @@
 
 from __future__ import annotations
 
-import json
+import logging
+from typing import Callable
 
-from hello_agents import ToolAwareSimpleAgent
+from langchain_core.messages import HumanMessage
+from langchain_core.runnables import RunnableConfig
+from langchain_openai import ChatOpenAI
 
-from models import SummaryState
-from config import Configuration
-from utils import strip_thinking_tokens
-from services.text_processing import strip_tool_calls
+from models import ResearchState
+from prompts import report_writer_instructions
 
+import os
+from services.notes import create_note
 
-class ReportingService:
-    """Generates the final structured report."""
+logger = logging.getLogger(__name__)
+MAX_SUMMARY_CHARS = 2000
 
-    def __init__(self, report_agent: ToolAwareSimpleAgent, config: Configuration) -> None:
-        self._agent = report_agent
-        self._config = config
+def make_reporter_node(llm:ChatOpenAI) -> Callable:
+    """Return a LangGraph node function for task planning."""
 
-    def generate_report(self, state: SummaryState) -> str:
-        """Generate a structured report based on completed tasks."""
+    def reporter_node(state:ResearchState,config:RunnableConfig) -> dict:
+        # 1. 取 event_sink
+        event_sink=(config.get("configurable")or {}).get("event_sink")
 
+        # 2.拼每个任务的摘要块
+        
         tasks_block = []
-        for task in state.todo_items:
-            summary_block = task.summary or "暂无可用信息"
+        for task in state["todo_items"]:
+            summary = task.summary or "暂无可用信息"
+            if len(summary) > MAX_SUMMARY_CHARS:
+                summary = summary[:MAX_SUMMARY_CHARS] + "... [truncated]"
             sources_block = task.sources_summary or "暂无来源"
             tasks_block.append(
                 f"### 任务 {task.id}: {task.title}\n"
                 f"- 任务目标：{task.intent}\n"
                 f"- 检索查询：{task.query}\n"
                 f"- 执行状态：{task.status}\n"
-                f"- 任务总结：\n{summary_block}\n"
+                f"- 任务总结：\n{summary}\n"
                 f"- 来源概览：\n{sources_block}\n"
             )
+        
+        # 3.拼 prompt
+        prompt = (
+            f"研究主题：{state['research_topic']}\n\n"
+            f"任务概览：\n{''.join(tasks_block)}\n\n"
+            + report_writer_instructions
+        )
 
-        note_references = []
-        for task in state.todo_items:
-            if task.note_id:
-                note_references.append(
-                    f"- 任务 {task.id}《{task.title}》：note_id={task.note_id}"
-                )
+        # 4. 调用 LLM 生成报告
+        try:
+            response=llm.invoke([HumanMessage(content=prompt)])
+            report_text=(
+                response.content
+                if isinstance(response.content,str)
+                else str(response.content)
+            )
+            report_text = report_text.strip() or "报告生成失败。"
+        except Exception as exc:
+            logger.error("reporter_node failed: %s", exc)
+            if event_sink:
+                event_sink({"type": "error", "content": str(exc)})
+            return {"structured_report": "报告生成失败。"}
 
-        notes_section = "\n".join(note_references) if note_references else "- 暂无可用任务笔记"
+        logger.info("Report generated, length=%d", len(report_text))
 
-        read_template = json.dumps({"action": "read", "note_id": "<note_id>"}, ensure_ascii=False)
-        create_conclusion_template = json.dumps(
-            {
-                "action": "create",
-                "title": f"研究报告：{state.research_topic}",
+        # 5. 发 SSE 事件
+        if event_sink:
+            event_sink({"type": "final_report", "content": report_text})
+
+        # 把报告存为 note（env ENABLE_NOTES 控制是否启用）
+        if os.getenv("ENABLE_NOTES", "true").lower() == "true":
+            result = create_note.invoke({
+                "title": f"研究报告：{state['research_topic']}",
+                "content": report_text,
                 "note_type": "conclusion",
                 "tags": ["deep_research", "report"],
-                "content": "请在此沉淀最终报告要点",
-            },
-            ensure_ascii=False,
-        )
+            })
+            # result 是 "笔记已创建，ID: xxxxxxxx" 这样的字符串
+            if event_sink:
+                event_sink({"type": "report_note", "content": result})
 
-        prompt = (
-            f"研究主题：{state.research_topic}\n"
-            f"任务概览：\n{''.join(tasks_block)}\n"
-            f"可用任务笔记：\n{notes_section}\n"
-            f"请针对每条任务笔记使用格式：[TOOL_CALL:note:{read_template}] 读取内容，整合所有信息后撰写报告。\n"
-            f"如需输出汇总结论，可追加调用：[TOOL_CALL:note:{create_conclusion_template}] 保存报告要点。"
-        )
+        # 6. 返回 state 更新
+        return {"structured_report": report_text}
+    
+    return reporter_node
 
-        response = self._agent.run(prompt)
-        self._agent.clear_history()
-
-        report_text = response.strip()
-        if self._config.strip_thinking_tokens:
-            report_text = strip_thinking_tokens(report_text)
-
-        report_text = strip_tool_calls(report_text).strip()
-
-        return report_text or "报告生成失败，请检查输入。"
 
