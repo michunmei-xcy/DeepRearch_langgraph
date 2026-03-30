@@ -86,7 +86,7 @@ def web_search(query: str) -> str:
     context = deduplicate_and_format_sources(
         search_response,
         max_tokens_per_source=MAX_TOKENS_PER_SOURCE,
-        max_total_context_tokens=MAX_TOTAL_CONTEXT_TOKENS,
+        # max_total_context_tokens=MAX_TOTAL_CONTEXT_TOKENS,
     )
     return context
 

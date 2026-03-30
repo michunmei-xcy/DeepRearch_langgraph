@@ -1,2 +1,1 @@
-"""Domain services for the deep researcher workflow."""
-
+"""HelloAgents Deep Research - A deep research assistant powered by LangGraph."""

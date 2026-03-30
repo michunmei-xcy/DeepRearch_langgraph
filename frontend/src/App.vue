@@ -1362,6 +1362,7 @@ select:focus {
   padding-right: 8px;
   scrollbar-width: thin;
   scrollbar-color: rgba(129, 140, 248, 0.45) rgba(226, 232, 240, 0.6);
+  flex-shrink: 0;
 }
 
 .timeline-wrapper::-webkit-scrollbar {

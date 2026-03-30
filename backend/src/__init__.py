@@ -1,18 +1,15 @@
-"""HelloAgents Deep Research - A deep research assistant powered by HelloAgents."""
-
+"""HelloAgents Deep Research - A deep research assistant powered by LangGraph."""
+from dotenv import load_dotenv                                                                                                                            
+load_dotenv()
 __version__ = "0.0.1"
-
-from .agent import DeepResearchAgent
+from .agent import build_graph
 from .config import Configuration, SearchAPI
-from .models import SummaryState, SummaryStateInput, SummaryStateOutput, TodoItem
+from .models import ResearchState, TodoItem
 
 __all__ = [
-    "DeepResearchAgent",
+    "build_graph",
     "Configuration",
     "SearchAPI",
-    "SummaryState",
-    "SummaryStateInput",
-    "SummaryStateOutput",
+    "ResearchState",
     "TodoItem",
 ]
-

@@ -14,6 +14,7 @@ from models import ResearchState, TodoItem
 from prompts import task_executor_instructions
 from services.notes import create_note, read_note, update_note
 from services.search import web_search
+from utils import strip_thinking_tokens
 
 logger = logging.getLogger(__name__)
 
@@ -51,6 +52,7 @@ def make_execute_task_node(llm: ChatOpenAI) -> Callable:
         try:
             result = agent.invoke({"messages": [HumanMessage(content=prompt)]}, config)
             messages = result.get("messages", [])
+
         except Exception as exc:
             logger.error("execute_task_node failed for task %d: %s", task.id, exc)
             task.status = "failed"
@@ -68,7 +70,7 @@ def make_execute_task_node(llm: ChatOpenAI) -> Callable:
                 break
 
         if event_sink and sources_text:
-            event_sink({"type": "sources", "task_id": task.id, "content": sources_text})
+            event_sink({"type": "sources", "task_id": task.id, "latest_sources": sources_text})
 
         # 6. 提取 summary：最后一条无 tool_calls 的 AIMessage
         summary = ""
@@ -78,17 +80,31 @@ def make_execute_task_node(llm: ChatOpenAI) -> Callable:
                 break
 
         # 7. 更新任务状态并写回列表
-        task.summary = summary or "暂无可用信息"
+        task.summary = strip_thinking_tokens(summary).strip() or "暂无可用信息"
         task.sources_summary = sources_text or None
         task.status = "completed"
         todo_items[idx] = task
 
         logger.info("Task %d (%s) completed, summary length=%d", task.id, task.title, len(task.summary))
 
-        # 8. 通知前端：任务完成 + 摘要
+        # 8. 发 tool_call 事件（每个 ToolMessage 对应一次工具调用）
+        if event_sink:
+            for msg in messages:
+                if isinstance(msg, ToolMessage):
+                    event_sink({
+                        "type": "tool_call",
+                        "event_id": id(msg),
+                        "agent": "executor",
+                        "tool": getattr(msg, "name", "unknown"),
+                        "parameters": {},
+                        "result": msg.content if isinstance(msg.content, str) else str(msg.content),
+                        "task_id": task.id,
+                    })
+
+        # 9. 通知前端：任务完成 + 摘要
         if event_sink:
             event_sink({"type": "task_status", "task_id": task.id, "status": "completed"})
-            event_sink({"type": "task_summary_chunk", "task_id": task.id, "chunk": task.summary})
+            event_sink({"type": "task_summary_chunk", "task_id": task.id, "content": task.summary})
 
         # 9. 返回更新后的 state
         return {

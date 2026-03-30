@@ -280,13 +280,13 @@ async def research_stream(request: ResearchRequest):
 ## 迁移流程（建议顺序）
 
 ### Step 1：环境准备
-- [ ] 更新 `pyproject.toml`，替换 `hello-agents` 为 `langgraph` + `langchain-openai`
+- [x] 更新 `pyproject.toml`，替换 `hello-agents` 为 `langgraph` + `langchain-openai`
 - [ ] `uv sync` 安装新依赖，确认能 import
 
 ### Step 2：改写 `models.py`
-- [ ] 将 `SummaryState` 改为 `ResearchState(TypedDict)`
-- [ ] 确认 `TodoItem` dataclass 字段不变
-- [ ] 决定 `todo_items` 的 reducer 策略（方式A或B，见上文）
+- [x] 将 `SummaryState` 改为 `ResearchState(TypedDict)`
+- [x] 确认 `TodoItem` dataclass 字段不变
+- [x] 决定 `todo_items` 的 reducer 策略（方式A或B，见上文）:策略A
 
 ### Step 3：初始化 LLM
 - [ ] 在 `config.py` 中添加 `get_llm()` 返回 `ChatOpenAI`

@@ -25,10 +25,14 @@ def make_planner_node(llm:ChatOpenAI) -> Callable:
         )
 
         # 2.调用LLM 
-        response=llm.invoke(
+        # response=llm.invoke(
+        #     SystemMessage(content=todo_planner_system_prompt),
+        #     HumanMessage(content=prompt),
+        # )
+        response = llm.invoke([
             SystemMessage(content=todo_planner_system_prompt),
             HumanMessage(content=prompt),
-        )
+        ])
 
         # 3.提取回答内容解析JSON
         raw=response.content if hasattr(response,"content") else str(response)

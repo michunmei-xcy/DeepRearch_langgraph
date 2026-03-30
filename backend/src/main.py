@@ -1,10 +1,12 @@
 """FastAPI entrypoint exposing the DeepResearchAgent via HTTP."""
 
 from __future__ import annotations
-
+from dotenv import load_dotenv                                                                                                                            
+load_dotenv() 
+import asyncio
 import json
 import sys
-from typing import Any, Dict, Iterator, Optional
+from typing import Any, AsyncIterator, Dict, Optional
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -13,7 +15,8 @@ from loguru import logger
 from pydantic import BaseModel, Field
 
 from config import Configuration, SearchAPI
-from agent import DeepResearchAgent
+from agent import build_graph
+  
 
 # 添加控制台日志处理程序
 logger.add(
@@ -119,13 +122,26 @@ def create_app() -> FastAPI:
     def run_research(payload: ResearchRequest) -> ResearchResponse:
         try:
             config = _build_config(payload)
-            agent = DeepResearchAgent(config=config)
-            result = agent.run(payload.topic)
+            graph = build_graph(config)
+            # result = agent.run(payload.topic)
+            initial_state = {
+                "research_topic": payload.topic,
+                "todo_items": [],
+                "web_research_results": [],
+                "sources_gathered": [],
+                "current_task_index": 0,
+                "research_loop_count": 0,
+                "structured_report": None,
+                "report_note_id": None,
+                "report_note_path": None,
+            }
+            result_state = graph.invoke(initial_state)
+            
         except ValueError as exc:  # Likely due to unsupported configuration
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except Exception as exc:  # pragma: no cover - defensive guardrail
             raise HTTPException(status_code=500, detail="Research failed") from exc
-
+        
         todo_payload = [
             {
                 "id": item.id,
@@ -138,33 +154,67 @@ def create_app() -> FastAPI:
                 "note_id": item.note_id,
                 "note_path": item.note_path,
             }
-            for item in result.todo_items
+            for item in result_state["todo_items"]
         ]
 
         return ResearchResponse(
-            report_markdown=(result.report_markdown or result.running_summary or ""),
+            report_markdown=(result_state["structured_report"] or ""),
             todo_items=todo_payload,
         )
 
     @app.post("/research/stream")
-    def stream_research(payload: ResearchRequest) -> StreamingResponse:
+    async def stream_research(payload: ResearchRequest) -> StreamingResponse:
         try:
             config = _build_config(payload)
-            agent = DeepResearchAgent(config=config)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-        def event_iterator() -> Iterator[str]:
-            try:
-                for event in agent.run_stream(payload.topic):
-                    yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
-            except Exception as exc:  # pragma: no cover - defensive guardrail
-                logger.exception("Streaming research failed")
-                error_payload = {"type": "error", "detail": str(exc)}
-                yield f"data: {json.dumps(error_payload, ensure_ascii=False)}\n\n"
+        async def event_generator() -> AsyncIterator[str]:
+            graph = build_graph(config)
+            queue: asyncio.Queue[dict | None] = asyncio.Queue()
+            loop = asyncio.get_event_loop()   # ← 在 async 上下文里拿 loop
+
+            # event_sink：节点内部调用，把事件放进 queue
+            def event_sink(event: dict) -> None:
+                # asyncio.get_event_loop().call_soon_threadsafe(queue.put_nowait, event)
+                loop.call_soon_threadsafe(queue.put_nowait, event)  # ← 用拿到的 loop
+
+            initial_state = {
+                "research_topic": payload.topic,
+                "todo_items": [],
+                "web_research_results": [],
+                "sources_gathered": [],
+                "current_task_index": 0,
+                "research_loop_count": 0,
+                "structured_report": None,
+                "report_note_id": None,
+                "report_note_path": None,
+            }
+            # graph.ainvoke 在后台跑，跑完往 queue 放 None 作为结束信号
+            async def run_graph():
+                try:
+                    await graph.ainvoke(
+                        initial_state,
+                        config={"configurable": {"event_sink": event_sink}},
+                    ) 
+                except Exception as exc:
+                    logger.error("Graph failed: {}", exc)
+                    queue.put_nowait({"type": "error", "detail": str(exc)})
+                finally:
+                    queue.put_nowait(None)  # 结束信号
+            
+            asyncio.create_task(run_graph())
+
+            while True:
+                event = await queue.get()
+                if event is None:
+                    break
+                yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+
+            yield f"data: {json.dumps({'type': 'done'}, ensure_ascii=False)}\n\n"
 
         return StreamingResponse(
-            event_iterator(),
+            event_generator(),
             media_type="text/event-stream",
             headers={
                 "Cache-Control": "no-cache",

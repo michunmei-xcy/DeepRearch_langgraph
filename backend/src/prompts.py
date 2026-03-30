@@ -45,7 +45,7 @@ todo_planner_instructions = """
 """
 
 
-task_summarizer_instructions = """
+task_executor_instructions = """
 你是一名研究执行专家，请基于给定的上下文，为特定任务生成要点总结，对内容进行详尽且细致的总结而不是走马观花，需要勇于创新、打破常规思维，并尽可能多维度，从原理、应用、优缺点、工程实践、对比、历史演变等角度进行拓展。
 
 <GOAL>

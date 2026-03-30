@@ -68,7 +68,7 @@ def make_reporter_node(llm:ChatOpenAI) -> Callable:
 
         # 5. 发 SSE 事件
         if event_sink:
-            event_sink({"type": "final_report", "content": report_text})
+            event_sink({"type": "final_report", "report": report_text})
 
         # 把报告存为 note（env ENABLE_NOTES 控制是否启用）
         if os.getenv("ENABLE_NOTES", "true").lower() == "true":

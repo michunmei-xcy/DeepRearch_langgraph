@@ -93,11 +93,11 @@ class Configuration(BaseModel):
     )
     max_total_context_tokens: int = Field(
         default=8000,
-        description="单次 LLM 调用中所有来源合并后的最大 token 数（0=不限制）",
+        description="每个搜索结果来源最多包含的 token 数",
     )
     max_reporter_summary_chars: int = Field(
         default=2000,
-        description="reporter prompt 中每个 task summary 的最大字符数",
+        description="每个搜索结果来源最多包含的 token 数",
     )
 
 
